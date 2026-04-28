@@ -2,12 +2,42 @@
 
 -- Configuration ---------------------------------------------------------------
 
--- List of binaries that will be tested
-local binaries = {
-    { 'lua-5.3.4', 'lua' },
-    { 'luajit-2.0.4-interp', 'luajit -joff' },
-    { 'luajit-2.0.4', 'luajit' },
-}
+-- 版本号与 `lua -v` / `luajit -v`、rpm 标签保持一致后改此处
+local lua_ver = '5.4.6'
+local luajit_ver = '2.1.20230821'
+local pgo_root = './pgo_lua_root'
+local pgo_ld = pgo_root .. '/usr/lib64'
+local pgo_bin = pgo_root .. '/usr/bin/lua'
+local pgo_luajit_root = './pgo_luajit_root'
+local pgo_luajit_ld = pgo_luajit_root .. '/usr/lib64'
+local pgo_luajit_bin = pgo_luajit_root .. '/usr/bin/luajit'
+
+local binaries
+
+local function binaries_for_preset(preset)
+    local lua_cmd = 'env LD_LIBRARY_PATH=' .. pgo_ld .. ':${LD_LIBRARY_PATH} ' .. pgo_bin
+    local luajit_pgo_cmd = 'env LD_LIBRARY_PATH=' .. pgo_luajit_ld .. ':${LD_LIBRARY_PATH} ' .. pgo_luajit_bin
+    if preset == 'lua' then
+        return {
+            { 'lua-base-' .. lua_ver, 'lua' },
+            { 'lua-perf-' .. lua_ver, lua_cmd },
+        }
+    elseif preset == 'luajit' then
+        return {
+            { 'luajit-base-' .. luajit_ver, 'luajit' },
+            { 'luajit-perf-' .. luajit_ver, luajit_pgo_cmd },
+        }
+    elseif preset == 'combined' then
+        -- 跑完后再折叠为 lua-base+luajit-base 与 lua-perf+luajit-perf 两列
+        return {
+            { 'lua-base-' .. lua_ver, 'lua' },
+            { 'lua-perf-' .. lua_ver, lua_cmd },
+            { 'luajit-base-' .. luajit_ver, 'luajit' },
+            { 'luajit-perf-' .. luajit_ver, luajit_pgo_cmd },
+        }
+    end
+    error('unknown preset: ' .. tostring(preset))
+end
 
 -- List of tests
 local tests_root = './'
@@ -37,9 +67,15 @@ local normalize = false
 local speedup = false
 local plot = true
 
+local preset = 'lua'
+
 local usage = [[
 usage: lua ]] .. arg[0] .. [[ [options]
 options:
+    --preset <name>  lua | luajit | combined | all (default = lua)
+                     lua=仅 lua-base vs lua-perf；luajit=luajit-base vs luajit-perf；
+                     combined=同一轮测四项后输出 (lua-base+luajit-base) vs (lua-perf+luajit-perf)；
+                     all=一次跑四项，生成三组 txt/png：<output>_lua / _luajit / _combined
     --nruns <n>      number of times that each test is executed (default = 3)
     --no-supress     don't supress error messages from tests
     --output <name>  name of the benchmark output
@@ -73,6 +109,8 @@ local function parse_args()
             supress_errors = false
         elseif arg[i] == '--output' then
             basename = get_next_arg(i)
+        elseif arg[i] == '--preset' then
+            preset = get_next_arg(i)
         elseif arg[i] == '--normalize' then
             normalize = true
         elseif arg[i] == '--speedup' then
@@ -205,13 +243,48 @@ local function teardown()
     os.execute('rm fasta1000000.txt')
 end
 
+-- 从四列原始结果中取出两列（1,2=lua，3,4=luajit）
+local function slice_raw(m, a, b)
+    local out = create_matrix(#m)
+    for i = 1, #m do
+        out[i][1] = m[i][a]
+        out[i][2] = m[i][b]
+    end
+    return out
+end
+
+local function fold_lua_plus_luajit(m)
+    local out = create_matrix(#m)
+    for i = 1, #m do
+        out[i][1] = m[i][1] + m[i][3]
+        out[i][2] = m[i][2] + m[i][4]
+    end
+    return out
+end
+
+local function dup_process_emit(src, bin_row, base_out, build_f)
+    binaries = bin_row
+    local res = create_matrix(#src)
+    for i = 1, #src do
+        for j = 1, #bin_row do
+            res[i][j] = src[i][j]
+        end
+    end
+    process_results(res, build_f)
+    basename = base_out
+    create_data_file(res)
+    if plot then generate_image() end
+end
+
 local function main()
     parse_args()
-    computer_info()
-    setup()
-    local results = run_all()
-    teardown()
-    local function f(v, base)
+    local valid = { lua = true, luajit = true, combined = true, all = true }
+    if not valid[preset] then
+        print('Error: unknown --preset ' .. preset .. '\n' .. usage)
+        os.exit(1)
+    end
+
+    local function build_f(v, base)
         if not v then
             return 0
         elseif not base then
@@ -224,7 +297,50 @@ local function main()
             return v
         end
     end
-    process_results(results, f)
+
+    local base_out = basename
+
+    local function run_once_fourcol()
+        computer_info()
+        setup()
+        binaries = binaries_for_preset('combined')
+        local raw = run_all()
+        teardown()
+        return raw
+    end
+
+    if preset == 'all' then
+        local raw = run_once_fourcol()
+        dup_process_emit(slice_raw(raw, 1, 2), binaries_for_preset('lua'), base_out .. '_lua', build_f)
+        dup_process_emit(slice_raw(raw, 3, 4), binaries_for_preset('luajit'), base_out .. '_luajit', build_f)
+        dup_process_emit(fold_lua_plus_luajit(raw), {
+            { 'lua-base+luajit-base', '' },
+            { 'lua-perf+luajit-perf', '' },
+        }, base_out .. '_combined', build_f)
+        print('final done')
+        return
+    end
+
+    computer_info()
+    setup()
+
+    local results
+    if preset == 'combined' then
+        binaries = binaries_for_preset('combined')
+        results = run_all()
+        teardown()
+        results = fold_lua_plus_luajit(results)
+        binaries = {
+            { 'lua-base+luajit-base', '' },
+            { 'lua-perf+luajit-perf', '' },
+        }
+    else
+        binaries = binaries_for_preset(preset)
+        results = run_all()
+        teardown()
+    end
+
+    process_results(results, build_f)
     create_data_file(results)
     if plot then generate_image() end
     print('final done')

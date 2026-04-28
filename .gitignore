@@ -1,1 +1,3 @@
 results.*
+pgo_lua_root/
+pgo_luajit_root/
